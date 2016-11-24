@@ -1,0 +1,559 @@
+package tlc.net.client;
+
+import java.awt.Color;
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import mhframework.gui.MHGUIChatClient;
+import mhframework.io.MHLogFile;
+import mhframework.io.MHTextFile;
+import mhframework.io.net.MHNetworkMessage;
+import mhframework.io.net.MHSerializableClientList;
+import mhframework.io.net.client.MHAbstractClient;
+import mhframework.io.net.client.MHLocalClient;
+import mhframework.io.net.client.MHNetworkClient;
+import mhframework.io.net.client.MHObservableClient;
+import mhframework.io.net.server.MHAbstractServer;
+import mhframework.io.net.server.MHServerModule;
+import mhframework.tilemap.MHMapCell;
+import mhframework.tilemap.MHMapCellAddress;
+import tlc.data.TLCCharacterList;
+import tlc.data.TLCDataFacade;
+import tlc.data.TLCGameOptions;
+import tlc.data.TLCPlayerMode;
+import tlc.data.TLCTeam;
+import tlc.data.TLCTeamColor;
+import tlc.data.characters.TLCCharacter;
+import tlc.net.TLCCharacterMoveMessage;
+import tlc.net.TLCMessageType;
+import tlc.net.server.TLCGameServer;
+import tlc.net.server.TLCPlayerDescriptor;
+import tlc.net.server.ai.TLCAIManager;
+import tlc.ui.hud.actions.TLCActionsMenu;
+
+public class TLCGameClient
+{
+    // Thipi Thai: 630-469-9001
+    private static final MHTextFile logFile = new MHLogFile("TLCGameClientLog.txt");
+    private static boolean isGameState = false;
+    
+    private MHObservableClient clientModule;
+
+    private Thread messageThread;
+    
+    private static ConcurrentLinkedQueue<MHNetworkMessage> overflow;
+
+    private static String mapFileName = null;
+
+    TLCDataFacade data;
+    long dataID;
+    
+    public TLCGameClient(long dataID)
+    {
+        this.dataID = dataID;
+        data = TLCDataFacade.getInstance(dataID);
+        messageThread = new Thread(new TLCMessageThread(this, dataID));
+    }
+
+
+    public void connect()
+    {
+        TLCPlayerMode mode = data.getPlayerMode();
+        if (mode == TLCPlayerMode.SINGLE_PLAYER ||
+            mode == TLCPlayerMode.HOST_LAN ||
+            mode == TLCPlayerMode.STANDALONE_HOST)
+        {
+            // Launch the server.
+            try
+            {
+                MHAbstractServer server = new MHServerModule();
+                server.setGameServer(new TLCGameServer());
+
+                String ip = server.getIPAddress();
+                if (ip == null || ip.length() == 0)
+                    ip = "127.0.0.1";
+                data.setServerIP(ip);
+
+                // Set color options in server.
+                final Color[] colors = new Color[TLCTeamColor.values().length];
+                for (int i = 0; i < colors.length; i++)
+                    colors[i] = TLCTeamColor.values()[i].getColorValue();
+                server.setColorOptions(colors);
+
+            }
+            catch (final IOException e)
+            {
+                e.printStackTrace();
+            }
+        } // if player mode
+        if (getClient() == null)  System.err.println("Client module is null.");
+
+        // Set the game options.
+        if (data.getPlayerMode() == TLCPlayerMode.SINGLE_PLAYER ||
+                data.getPlayerMode() == TLCPlayerMode.HOST_LAN)
+            sendGameOptions(TLCDataFacade.getGameOptions());
+        
+        // Register player name.
+        data.registerPlayerName();
+       
+        // Register user type.
+        data.registerUserType();
+    }
+
+    
+    static ConcurrentLinkedQueue<MHNetworkMessage> getOverflowQueue()
+    {
+        if (overflow == null)
+            overflow = new ConcurrentLinkedQueue<MHNetworkMessage>();
+
+        return overflow;
+    }
+
+
+
+    public static void log(final String data)
+    {
+        logFile.write(data);
+    }
+
+    
+    public String getUserType()
+    {
+        return data.getPlayerMode().toString();
+    }
+
+
+    public boolean isConnected()
+    {
+        if (clientModule == null) return false;
+        
+        return getClient().getStatus() == MHAbstractClient.STATUS_CONNECTED;
+    }
+
+
+    public boolean isErrorState()
+    {
+        
+        return getClient().isErrorState();
+    }
+
+
+    public String getStatusMessage()
+    {
+        if (clientModule == null) return "Not connected.";
+        return getClient().getStatusMessage();
+    }
+
+
+    public MHGUIChatClient createChatClient(final int x, final int y, final int w, final int h)
+    {
+        return new MHGUIChatClient(clientModule, x, y, w, h);
+    }
+
+    
+    private MHAbstractClient getClient()
+    {
+        if (clientModule == null)
+        {
+            if (data.isLocal())// For local clients:
+            {
+                try 
+                { 
+                    clientModule = new MHObservableClient(new MHLocalClient(new MHServerModule()));
+                } 
+                catch (IOException e) { e.printStackTrace(); }
+            }
+            else // For network clients:
+            {
+                String ip = data.getServerIP();
+                clientModule = new MHObservableClient(MHNetworkClient.create(ip));
+            }
+            
+            messageThread.start();
+            
+            // Give things a chance to get started.
+            try {Thread.sleep(2000);}  
+            catch (final InterruptedException e){}
+        }
+
+        return clientModule.getClient();
+    }
+
+
+    public String getPlayerName()
+    {
+        String name = getClient().getPlayerName();
+        if (name == null)
+            name = getUserType() + " " + getClient().getClientID();
+
+        return name;
+    }
+
+
+    public int getClientID()
+    {
+        return getClient().getClientID();
+    }
+
+
+    public void disconnect()
+    {
+        getClient().disconnect();
+        clientModule = null;
+    }
+
+
+    public void send(final String messageType, final Serializable payload)
+    {
+        getClient().sendMessage(new MHNetworkMessage(messageType, payload, getClientID()));
+        log("TLCGameClient.send("+messageType+")");
+    }
+
+    
+    private void sendGameOptions(final TLCGameOptions o)
+    {
+        send(TLCMessageType.GAME_OPTIONS, o.getSerializableVersion());
+    }
+    
+    public void sendRecruitMessage(TLCCharacter c)
+    {
+        send(TLCMessageType.RECRUIT_CHARACTER, c.getSerializableVersion());
+    }
+    
+
+    public void sendSignalReadyMessage(boolean ready)
+    {
+        send(TLCMessageType.SIGNAL_READY, ready);
+    }
+    
+
+    public void sendCharacterUpdateMessage(TLCCharacter c)
+    {
+        send(TLCMessageType.UPDATE_CHARACTER, c.getSerializableVersion());
+    }
+    
+
+    public Color[] getColorList()
+    {
+        return getClient().getAvailableColors();
+    }
+
+
+    public boolean isMessageWaiting()
+    {
+        return getClient().isMessageWaiting();
+    }
+
+
+    public MHNetworkMessage getMessage()
+    {
+        return getClient().getMessage();
+    }
+
+
+    public MHSerializableClientList getClientList()
+    {
+        return getClient().getClientList();
+    }
+
+
+    public void clearErrorState()
+    {
+        getClient().clearErrorState();
+    }
+
+    
+    public void setPlayerColor(final Color color)
+    {
+        getClient().registerPlayerColor(color);
+    }
+
+
+    public MHNetworkMessage peek()
+    {
+        return getClient().peek();
+    }
+
+
+    public void sendCharacterUpdateMessage(TLCCharacter character,
+            boolean upgradePurchased)
+    {
+        sendCharacterUpdateMessage(character);
+        if (upgradePurchased)
+            sendTeamUpdateMessage(TLCDataFacade.getTeam(character.getTeamID()));
+    }
+
+
+    private void sendTeamUpdateMessage(TLCTeam team)
+    {
+        send(TLCMessageType.UPDATE_TEAM, team.getSerializableVersion());
+    }
+
+
+    public void sendRetireMessage(TLCCharacter c)
+    {
+        send(TLCMessageType.RETIRE_CHARACTER, c.getSerializableVersion());
+    }
+
+
+    public void setGameState(boolean game)
+    {
+        isGameState = game;
+    }
+
+    
+    public boolean isInGameState()
+    {
+        return isGameState;
+    }
+
+
+    public static String getMapFileName()
+    {
+        String fName = mapFileName;
+        mapFileName = null;
+        
+        return fName;
+    }
+
+
+    public void setMapFileName(String mapFile)
+    {
+        mapFileName = mapFile;
+    }
+
+
+    public void queueMessage(MHNetworkMessage message)
+    {
+        getClient().queueMessage(message);
+    }
+
+
+    public void registerPlayerName(String playerName)
+    {
+        getClient().registerPlayerName(playerName);
+    }
+}
+
+
+class TLCMessageThread implements Runnable
+{
+    private String lastMessage;
+    private TLCGameClient client;
+    TLCDataFacade data;
+    long dataID;
+
+    public TLCMessageThread(TLCGameClient c, long dataID)
+    {
+        client = c;
+        this.dataID = dataID;
+        data = TLCDataFacade.getInstance(dataID);
+    }
+    
+    @Override
+    public void run()
+    {
+        while (true)
+        {
+            if (client.isMessageWaiting())
+            {
+                MHNetworkMessage message = client.peek();
+                lastMessage = message.getMessageType();
+
+                if (!lastMessage.equals(message.getMessageType()))
+                    TLCGameClient.log("TLCGameClient.TLCMessageThread.run("+message.getMessageType()+")");
+                
+                if (!process(message)) // If message not processed, put it in the overflow queue.
+                    TLCGameClient.getOverflowQueue().add(client.getMessage());
+                else  // Else just remove it.
+                    client.getMessage();  
+            }
+            else
+            {
+                // See if there's anything in the overflow queue we can process.
+                for (MHNetworkMessage m : TLCGameClient.getOverflowQueue())
+                {
+                    if (process(m)) // If message processed, remove it.
+                        TLCGameClient.getOverflowQueue().remove(m);
+                }
+            }
+            
+            try {Thread.sleep(500);} catch (InterruptedException e){}
+        }
+    }
+    
+    
+    private boolean process(MHNetworkMessage message)
+    {
+        data = TLCDataFacade.getInstance(dataID);
+        String s = "";
+
+        if (message.getMessageType().equals(TLCMessageType.UPDATE_TEAM))
+        {
+            final TLCTeam team = (TLCTeam)message.getPayload();
+            s = "Team " + team.getID() + " received.";
+            //System.out.println(s);
+            TLCGameClient.log(s);
+            TLCGameClient.log(team.toString());
+            
+            data.updateTeam(team);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.WHOSE_TURN))
+        {
+            System.out.println(message.getMessageType()+": "+message.getPayload());
+
+            int whoseTurn = ((Integer)message.getPayload()).intValue();
+            TLCDataFacade.setWhoseTurn(whoseTurn);
+
+            // Reset action points to full.
+            TLCDataFacade.resetActionPoints();
+            
+
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.CHARACTER_MOVE))
+        {
+            TLCCharacterMoveMessage moveMsg = (TLCCharacterMoveMessage) message;
+            MHMapCellAddress location = new MHMapCellAddress(moveMsg.getOldRow(), moveMsg.getOldCol());
+            TLCDataFacade.getGameWorld().putObject(null, location, MHMapCell.WALL_LAYER);
+
+            TLCCharacter target = TLCDataFacade.getCharacterList().get(moveMsg.getCharID());
+            location.row = moveMsg.getNewRow();
+            location.column = moveMsg.getNewCol();
+            target.walkTo(location);
+            
+//            TLCCharacter c = TLCCharacter.deserialize(message.getPayload());
+//            TLCCharacter target = TLCDataFacade.getCharacterList().get(c.getCharacterID());
+//            target.walkTo(c.getMapLocation());
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.RECRUIT_CHARACTER) || 
+                 message.getMessageType().equals(TLCMessageType.UPDATE_CHARACTER))
+        {
+            TLCCharacter c = TLCCharacter.deserialize(message.getPayload());
+            
+            // TODO: Remove character from old location, if exists.
+            TLCCharacter oldChar = TLCDataFacade.getCharacterList().get(c.getCharacterID());
+            if (oldChar != null)
+            {
+                
+                // DEBUG
+                if (c.getName().equalsIgnoreCase("Test"))
+                    System.out.println("TEST: oldChar != null");
+                
+                MHMapCellAddress address = oldChar.getMapLocation();
+                if (address != null)
+                {
+                    
+                    // DEBUG
+                    if (c.getName().equalsIgnoreCase("Test"))
+                        System.out.println("TEST: oldChar.getMapLocation() != null");
+                    
+                    System.out.println("REMOVING CHARACTER FROM " + address);
+                    TLCDataFacade.getGameWorld().putObject(null, address, MHMapCell.WALL_LAYER);
+                    //TLCDataFacade.getCharacterList().remove(c.getCharacterID());
+                }
+            }
+            
+            TLCDataFacade.getCharacterList().add(c);
+            
+            s = "Character received:" + c.toString();
+            //System.out.println(s);
+            TLCGameClient.log(s);
+
+            TLCDataFacade.getGameWorld().putObject(c, c.getMapLocation(), MHMapCell.WALL_LAYER);
+            //TLCDataFacade.getGameWorld().putFineObject(c);
+            
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.RETIRE_CHARACTER))
+        {
+            TLCCharacter c = TLCCharacter.deserialize(message.getPayload());
+            TLCDataFacade.getCharacterList().remove(c);
+            
+            s = "Character " + c.getCharacterID() + " retired and removed. (" + c.getGender().getName() + " " + c.getType().getTitle() + " on Team " + c.getTeamID() + ".)";
+            TLCGameClient.log(s);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.UPDATE_PLAYER_DATA))
+        {
+            TLCPlayerDescriptor user = (TLCPlayerDescriptor) message.getPayload();
+            data.addUser(user);
+            //System.out.println("\t"+user.toString());
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.REGISTER_USER_TYPE))
+        {
+            TLCPlayerDescriptor user = (TLCPlayerDescriptor) message.getPayload();
+            data.addUser(user);
+            data.setPlayerMode(user.type);
+            String name = user.name;
+            String role = user.type.toString();         
+            s = "User type received:  " + name + " is a " + role;
+            TLCGameClient.log(s);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.REGISTER_COLOR_ERROR))
+        {
+            s = (String)message.getPayload();
+            System.err.println(s);
+            TLCGameClient.log(s);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.CHAT))
+        {
+            client.queueMessage(message);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.BROADCAST_GAME_STATE))
+        {
+            boolean game = ((Boolean)(message.getPayload())).booleanValue();
+            client.setGameState(game);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.BROADCAST_MAP_FILE))
+        {
+            String mapFile = (String) message.getPayload();
+            client.setMapFileName(mapFile);
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.GAME_OPTIONS))
+        {
+            TLCDataFacade.setGameOptions((TLCGameOptions)message.getPayload());
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.BROADCAST_CHARACTER_LIST))
+        {
+            TLCDataFacade.setCharacterList(TLCCharacterList.deserialize(message.getPayload()));
+            return true;
+        }
+        else if (message.getMessageType().equals(TLCMessageType.REQUEST_MOVE_POINTS))
+        {
+            int mp = Integer.parseInt(message.getPayload().toString());
+            getSelectedCharacter().setMovementPoints(mp);
+            
+            // DEBUG
+            System.out.println("Received " + mp + " movement points.");
+            
+            return true;
+        }
+        else
+        {
+            s = "ERROR:  Message not handled by Client " + client.getClientID() + ":  " + message.getMessageType();
+            System.err.println(s);
+            TLCGameClient.log(s);
+            return false;
+        }
+    }
+    
+    private TLCCharacter getSelectedCharacter()
+    {
+        // For human players:
+        if (data.isHumanPlayer(TLCDataFacade.getWhoseTurn()))
+            return TLCActionsMenu.getSelectedCharacter();
+        
+        // For AI players:
+        return TLCAIManager.getSelectedCharacter();
+    }
+}
